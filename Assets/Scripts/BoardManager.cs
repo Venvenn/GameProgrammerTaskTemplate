@@ -1,38 +1,50 @@
 ﻿using System;
-using System.Collections;
 using System.Collections.Generic;
+using System.Threading.Tasks;
+using Gpt4All;
 using UnityEngine;
 
 public class BoardManager : MonoBehaviour
 {
-    public static BoardManager Instance { get; set; }
-    private bool[,] allowedMoves { get; set; }
-
+    public const int BOARD_SIZE_X = 8;
+    public const int BOARD_SIZE_Y = 8;
+    
+    private const float BOUNCE_DURATION = 0.2f;
     private const float TILE_SIZE = 1.0f;
     private const float TILE_OFFSET = 0.5f;
 
-    private int selectionX = -1;
-    private int selectionY = -1;
-
+    public bool isWhiteTurn = true;
+    public Material selectedMat;
     public List<GameObject> chessmanPrefabs;
-    private List<GameObject> activeChessman;
 
+    [SerializeField]
+    private BounceMechanicSettings _bounceMechanicSettings;
+    [SerializeField]
+    private LlmManager _llmManager;
+    
+    private int _selectionX = -1;
+    private int _selectionY = -1;
+    
     private Quaternion whiteOrientation = Quaternion.Euler(0, 270, 0);
     private Quaternion blackOrientation = Quaternion.Euler(0, 90, 0);
-
+   
+    private Material _previousMat;
+    private List<Chessman> _activeChessman;
+    private Chessman _selectedChessman;
+    private BounceSystem _bounceSystem;
+    
+    public static BoardManager Instance { get; set; }
+    
+    public int[] EnPassantMove { get; set; }
     public Chessman[,] Chessmans { get; set; }
-    private Chessman selectedChessman;
-
-    public bool isWhiteTurn = true;
-
-    private Material previousMat;
-    public Material selectedMat;
-
-    public int[] EnPassantMove { set; get; }
+    
+    private bool[,] _allowedMoves { get; set; }
 
     // Use this for initialization
     void Start()
     {
+        _bounceSystem = new BounceSystem(_bounceMechanicSettings);
+        
         Instance = this;
         SpawnAllChessmans();
         EnPassantMove = new int[2] { -1, -1 };
@@ -45,17 +57,17 @@ public class BoardManager : MonoBehaviour
 
         if (Input.GetMouseButtonDown(0))
         {
-            if (selectionX >= 0 && selectionY >= 0)
+            if (_selectionX >= 0 && _selectionY >= 0)
             {
-                if (selectedChessman == null)
+                if (_selectedChessman == null)
                 {
                     // Select the chessman
-                    SelectChessman(selectionX, selectionY);
+                    SelectChessman(_selectionX, _selectionY);
                 }
                 else
                 {
                     // Move the chessman
-                    MoveChessman(selectionX, selectionY);
+                    MoveChessman(_selectionX, _selectionY);
                 }
             }
         }
@@ -72,12 +84,12 @@ public class BoardManager : MonoBehaviour
 
         bool hasAtLeastOneMove = false;
 
-        allowedMoves = Chessmans[x, y].PossibleMoves();
+        _allowedMoves = Chessmans[x, y].PossibleMoves();
         for (int i = 0; i < 8; i++)
         {
             for (int j = 0; j < 8; j++)
             {
-                if (allowedMoves[i, j])
+                if (_allowedMoves[i, j])
                 {
                     hasAtLeastOneMove = true;
                     i = 8;
@@ -89,31 +101,137 @@ public class BoardManager : MonoBehaviour
         if (!hasAtLeastOneMove)
             return;
 
-        selectedChessman = Chessmans[x, y];
-        previousMat = selectedChessman.GetComponent<MeshRenderer>().material;
-        selectedMat.mainTexture = previousMat.mainTexture;
-        selectedChessman.GetComponent<MeshRenderer>().material = selectedMat;
+        _selectedChessman = Chessmans[x, y];
+        _previousMat = _selectedChessman.GetComponent<MeshRenderer>().material;
+        selectedMat.mainTexture = _previousMat.mainTexture;
+        _selectedChessman.GetComponent<MeshRenderer>().material = selectedMat;
 
-        BoardHighlights.Instance.HighLightAllowedMoves(allowedMoves);
+        BoardHighlights.Instance.HighLightAllowedMoves(_allowedMoves);
     }
 
-    private bool calculateVictory()
+    private async Task<FightResult> CalculateVictory(Chessman attacker, Chessman defender)
     {
-        var rng = new System.Random();
-        return rng.Next(0, 100) < 50;
+        FightResult fightResult = _bounceSystem.ResolveFight(attacker, defender);
+        
+        var freeSpaces = GetAdjacentFreeSpaces(defender.CurrentX, defender.CurrentY);
+        bool spacesAvailable = freeSpaces.Count > 0;
+        
+        switch (fightResult)
+        {
+            case FightResult.Win:
+            {
+                if (spacesAvailable)
+                {
+                    attacker.ToggleSpinner(true);
+                    var defenderTile = await _bounceSystem.BounceToTile(_llmManager, freeSpaces);
+                    attacker.ToggleSpinner(false);
+                    await BounceChessman(defender, (defender.CurrentX, defender.CurrentY), defenderTile);
+                }
+                else
+                {
+                    KillChessman(defender);  
+                }
+
+                if (!attacker.IsAlive())
+                {
+                    KillChessman(attacker);
+                    _selectedChessman = null;
+                }
+                break;   
+            }
+            case FightResult.Lose:
+            {
+                if (spacesAvailable)
+                {
+                    attacker.ToggleSpinner(true);
+                    var attackerTile = await _bounceSystem.BounceToTile(_llmManager, freeSpaces);
+                    attacker.ToggleSpinner(false);
+                    await BounceChessman(attacker, (defender.CurrentX, defender.CurrentY), attackerTile);
+            
+                }
+                else
+                {
+                    KillChessman(attacker);
+                    _selectedChessman = null;
+                }
+
+                if (!defender.IsAlive())
+                {
+                    KillChessman(defender);
+                }
+                break;
+            }
+            case FightResult.Draw:
+            {
+                if (spacesAvailable)
+                {
+                    if (defender.IsAlive())
+                    {
+                        attacker.ToggleSpinner(true);
+                        var defenderTileDraw = await _bounceSystem.BounceToTile(_llmManager, freeSpaces);
+                        Task bounce1 = BounceChessman(defender, (defender.CurrentX, defender.CurrentY), defenderTileDraw);
+                        freeSpaces.Remove(defenderTileDraw);
+                        var attackerTileDraw = await _bounceSystem.BounceToTile(_llmManager, freeSpaces);
+                        attacker.ToggleSpinner(false);
+                        Task bounce2 = BounceChessman(attacker, (defender.CurrentX, defender.CurrentY), attackerTileDraw);
+                        await Task.WhenAll(bounce1, bounce2);
+           
+                    }
+                    else
+                    {
+                        KillChessman(defender);
+                    }
+                }
+                else
+                {
+                    KillChessman(attacker);
+                    KillChessman(defender);
+                    _selectedChessman = null;
+                }
+
+                break;
+            }
+        }
+
+        attacker.ToggleSpinner(false);
+        
+        return fightResult;
     }
 
-    private void MoveChessman(int x, int y)
+    private async Task BounceChessman(Chessman chessman, (int x, int y) startTile, (int x, int y) targetTile)
     {
-        if (allowedMoves[x, y])
+        if (chessman.IsAlive())
+        {
+            Chessmans[chessman.CurrentX, chessman.CurrentY] = null;
+            await LerpBouncePosition(chessman, GetTileCenter(startTile.x, startTile.y), GetTileCenter(targetTile.x, targetTile.y), BOUNCE_DURATION);
+            chessman.SetPosition(targetTile.x, targetTile.y);
+            Chessmans[targetTile.x, targetTile.y] = chessman;
+        }
+        else
+        {
+            KillChessman(chessman);
+        }
+    }
+
+    private void KillChessman(Chessman chessman)
+    {
+        Chessmans[chessman.CurrentX, chessman.CurrentY] = null;
+        _activeChessman.Remove(chessman);
+        chessman.Kill();
+    }
+
+    private async void MoveChessman(int x, int y)
+    {
+        BoardHighlights.Instance.HideHighlights();
+        
+        if (_allowedMoves[x, y])
         {
             Chessman c = Chessmans[x, y];
-            var victory = true;
+            FightResult fightResult = FightResult.Win;
 
             if (c != null && c.isWhite != isWhiteTurn)
             {
                 // Capture a piece
-
                 if (c.GetType() == typeof(King))
                 {
                     // End the game
@@ -121,17 +239,8 @@ public class BoardManager : MonoBehaviour
                     return;
                 }
 
-                victory = calculateVictory();
-                if (victory)
-                {
-                    activeChessman.Remove(c.gameObject);
-                    Destroy(c.gameObject);
-                }
-                else
-                {
-                    activeChessman.Remove(selectedChessman.gameObject);
-                    Destroy(selectedChessman.gameObject);
-                }
+                await LerpBouncePosition(_selectedChessman, GetTileCenter(_selectedChessman.CurrentX, _selectedChessman.CurrentY), GetTileCenter(c.CurrentX, c.CurrentY), BOUNCE_DURATION);
+                fightResult = await CalculateVictory(_selectedChessman, c);
             }
             if (x == EnPassantMove[0] && y == EnPassantMove[1])
             {
@@ -139,49 +248,49 @@ public class BoardManager : MonoBehaviour
                     c = Chessmans[x, y - 1];
                 else
                     c = Chessmans[x, y + 1];
-
-                activeChessman.Remove(c.gameObject);
-                Destroy(c.gameObject);
+                
+                KillChessman(c);
             }
             EnPassantMove[0] = -1;
             EnPassantMove[1] = -1;
-            if (selectedChessman.GetType() == typeof(Pawn))
+            if (_selectedChessman != null && _selectedChessman.GetType() == typeof(Pawn))
             {
                 if (y == 7) // White Promotion
                 {
-                    activeChessman.Remove(selectedChessman.gameObject);
-                    Destroy(selectedChessman.gameObject);
+                    KillChessman(_selectedChessman);
                     SpawnChessman(1, x, y, true);
-                    selectedChessman = Chessmans[x, y];
+                    _selectedChessman = Chessmans[x, y];
                 }
                 else if (y == 0) // Black Promotion
                 {
-                    activeChessman.Remove(selectedChessman.gameObject);
-                    Destroy(selectedChessman.gameObject);
+                    KillChessman(_selectedChessman);
                     SpawnChessman(7, x, y, false);
-                    selectedChessman = Chessmans[x, y];
+                    _selectedChessman = Chessmans[x, y];
                 }
                 EnPassantMove[0] = x;
-                if (selectedChessman.CurrentY == 1 && y == 3)
+                if (_selectedChessman.CurrentY == 1 && y == 3)
                     EnPassantMove[1] = y - 1;
-                else if (selectedChessman.CurrentY == 6 && y == 4)
+                else if (_selectedChessman.CurrentY == 6 && y == 4)
                     EnPassantMove[1] = y + 1;
             }
 
-            if (victory)
+            if (_selectedChessman != null && fightResult == FightResult.Win)
             {
-                Chessmans[selectedChessman.CurrentX, selectedChessman.CurrentY] = null;
-                selectedChessman.transform.position = GetTileCenter(x, y);
-                selectedChessman.SetPosition(x, y);
-                Chessmans[x, y] = selectedChessman;
+                Chessmans[_selectedChessman.CurrentX, _selectedChessman.CurrentY] = null;
+                _selectedChessman.transform.position = GetTileCenter(x, y);
+                _selectedChessman.SetPosition(x, y);
+                Chessmans[x, y] = _selectedChessman;
             }
+
             isWhiteTurn = !isWhiteTurn;
         }
 
-        selectedChessman.GetComponent<MeshRenderer>().material = previousMat;
-
-        BoardHighlights.Instance.HideHighlights();
-        selectedChessman = null;
+        if (_selectedChessman != null)
+        {
+            _selectedChessman.GetComponent<MeshRenderer>().material = _previousMat;
+        }
+        
+        _selectedChessman = null;
     }
 
     private void UpdateSelection()
@@ -191,17 +300,17 @@ public class BoardManager : MonoBehaviour
         RaycastHit hit;
         if (Physics.Raycast(Camera.main.ScreenPointToRay(Input.mousePosition), out hit, 50.0f, LayerMask.GetMask("ChessPlane")))
         {
-            selectionX = (int)hit.point.x;
-            selectionY = (int)hit.point.z;
+            _selectionX = (int)hit.point.x;
+            _selectionY = (int)hit.point.z;
         }
         else
         {
-            selectionX = -1;
-            selectionY = -1;
+            _selectionX = -1;
+            _selectionY = -1;
         }
     }
 
-    private void SpawnChessman(int index, int x, int y, bool isWhite)
+    private async void SpawnChessman(int index, int x, int y, bool isWhite)
     {
         Vector3 position = GetTileCenter(x, y);
         GameObject go;
@@ -215,10 +324,14 @@ public class BoardManager : MonoBehaviour
             go = Instantiate(chessmanPrefabs[index], position, blackOrientation) as GameObject;
         }
 
+        ChessmanBounceData bounceData = await _bounceSystem.CreateBounceData(_llmManager);
+        
         go.transform.SetParent(transform);
         Chessmans[x, y] = go.GetComponent<Chessman>();
         Chessmans[x, y].SetPosition(x, y);
-        activeChessman.Add(go);
+        Chessmans[x,y].SetBounceData(bounceData);
+        
+        _activeChessman.Add(Chessmans[x, y]);
     }
 
     private Vector3 GetTileCenter(int x, int y)
@@ -230,9 +343,40 @@ public class BoardManager : MonoBehaviour
         return origin;
     }
 
+    private List<(int x, int y)> GetAdjacentFreeSpaces(int centerX, int centerY)
+    {
+        List<(int x, int y)> validTiles = new List<(int x, int y)>();
+        for (int y = centerY - 1; y <= centerY + 1; y++)
+        {
+            for (int x = centerX - 1; x <= centerX + 1; x++)
+            {
+                if (x >= 0 && x < BOARD_SIZE_X && y >= 0 && y < BOARD_SIZE_Y)
+                {
+                    if (Chessmans[x,y] == null)
+                    {
+                        validTiles.Add((x,y)); 
+                    }
+                }
+            }
+        }
+
+        return validTiles;
+    }
+
+    private async Task LerpBouncePosition(Chessman chessman, Vector3 startPos,  Vector3 targetPos, float duration)
+    {
+        float time = 0;
+        while (chessman.transform.position != targetPos)
+        {
+            time += Time.deltaTime;
+            chessman.transform.position = Vector3.Lerp(startPos, targetPos, time / duration);
+            await Task.Yield();
+        }
+    }
+
     private void SpawnAllChessmans()
     {
-        activeChessman = new List<GameObject>();
+        _activeChessman = new List<Chessman>();
         Chessmans = new Chessman[8, 8];
 
         /////// White ///////
@@ -260,8 +404,7 @@ public class BoardManager : MonoBehaviour
         {
             SpawnChessman(5, i, 1, true);
         }
-
-
+        
         /////// Black ///////
 
         // King
@@ -296,9 +439,9 @@ public class BoardManager : MonoBehaviour
         else
             Debug.Log("Black wins");
 
-        foreach (GameObject go in activeChessman)
+        foreach (Chessman chessman in _activeChessman)
         {
-            Destroy(go);
+            chessman.Kill();
         }
 
         isWhiteTurn = true;
